@@ -1,0 +1,161 @@
+Here are some functions I created for psychometric analysis. These functions allow users to quickly convert their data formats or generate primary CFA syntax, which might be useful for =lavaan= users. Also, I wrote some functions to have a quick check for data quality. Indeed, some external packages might be useful since they evaluate "low quality data" by some statistical approaches. However the functions here aim to detect "response patterns" by directly inspecting the actual responses. At this point of time I didn't wrote any information about these function neither instructions about how to use them since it took me long to debug and I am slacking off XD, however I will gradually add some descriptions on every weekend.
+
+* Generate Scoring keys
+
+#+begin_src R :tangle ./general_methods.R
+keys_gen <- function(...) {
+  params <- list(...)
+  stopifnot(length(params)%%2==0)
+  lefts = params[seq(1,length(params), by=2)]
+  rights = params[seq(2,length(params), by=2)]
+  rights <- Map(paste, rights, collapse=" + ")
+  paste(paste0(lefts, " =~ ", rights), collapse="\n")
+}
+#+end_src
+
+* Get trial-by-trial & question-by-question response data
+
+Since `select ()` exists in both `psych` and `tidyverse` packages we use `dplyr::select()` for tidying data.
+
+#+begin_src R :tangle ./general_methods.R
+getReDat <- function(dat, by = "q", reverse = FALSE, keys) {
+  if (by == "q") {
+    tmp <- dat %>%
+      mutate(q_num = paste0("q", .$q_num)) %>% 
+      pivot_wider (
+        .,
+        id_cols = c (p_id, order_index),
+        names_from = q_num,
+        values_from = response
+      )
+  } else if (by == "t") {
+    tmp <- dat %>%
+      mutate(t_num = paste0("t", .$t_num)) %>% 
+      pivot_wider (
+        .,
+        id_cols = c (p_id, order_index),
+        names_from = t_num,
+        values_from = response
+      )
+  }
+  if (reverse == TRUE) {
+    tmp <- tmp %>%  
+      mutate (across(match (paste0("q", keys), 
+                            names(tmp)),
+                     ~ case_when(. == 1 ~ 5,
+                                 . == 2 ~ 4,
+                                 . == 3 ~ 3,
+                                 . == 4 ~ 2,
+                                 . == 5 ~ 1)))
+  }
+  tmp <- tmp %>% 
+    mutate (total = rowSums(.[, 3:length(.)]))
+  return (tmp)
+}
+#+end_src
+
+* Quality evaluation
+
+#+begin_src R :tangle ./general_methods.R
+# data quality check
+
+## -------- RUNS ---------
+get_runs <- function (data, id_col, reverse = FALSE) {
+  dat_w <- getReDat(data, by = "t") |> 
+    dplyr::select (-order_index)
+  only_response <- dat_w |> dplyr::select (-any_of(id_col))
+  runs <- lapply (1:nrow(only_response),
+                  \(.x) rle (only_response[.x, ])) |>
+    sapply (`[[`, 'lengths')
+  
+  names(runs) <- dat_w[[id_col]]
+  run_sum <- data.frame (p_id = dat_w[[id_col]],
+                         runs = unlist(lapply(runs, length))
+  )
+  rownames(run_sum) <- NULL
+  return (run_sum)
+}
+
+## ------ Potential casual or repeated RESPONSES ------
+## requires long-formatted data
+detect_casual_or_repeat <- function (data, id_col, ques_leng) {
+  run_sum <- get_runs (data, id_col)
+  data <- data |>
+    mutate (runs = rep (run_sum$runs, each = ques_leng))
+  runs_outliers <- subset (run_sum, runs <= quantile (runs, prob = 0.05) | runs >= quantile (runs, prob = 0.95))[[id_col]]
+  problematic_dat <- filter (data, data[[id_col]] %in% runs_outliers)  |> ## remove top and bottom 5% of runs
+    mutate (diag = "casual or repeated answers")
+  return (problematic_dat)
+}
+
+## ------ Conservative Answers -------
+## requires wide-formatted data
+detect_conservative <- function (data, id_col) {
+  con_subj_id <- array()
+  N <- 1
+  for (j in 1:length (unique(data[[id_col]]))) {
+    tmp <- subset (data, data[[id_col]] == unique(data[[id_col]])[j])
+    if (length (unique (tmp$response)) <= 3) {
+      con_subj_id[N] <- unique(data[[id_col]])[j]
+      N <- N + 1
+    }
+  }
+  problematic_dat <- filter (data, data[[id_col]] %in% con_subj_id)  |> ## remove top and bottom 5% of runs
+    mutate (diag = "conservative answers")
+  return (problematic_dat)
+}
+
+## --------- Alternative Answers ------
+## requires long-formatted data
+detect_alternative <- function (data, id_col) {
+  dat_w <- getReDat(data, by = "t") |> 
+    dplyr::select (-order_index)
+  only_response <- dat_w |> dplyr::select (-any_of(data[[id_col]]))
+  alt_run <- array()
+  for (g in 1:nrow (only_response)) {
+    tmp <- as.array (t (only_response[g, ]))
+    alter <- 0
+    ind <- 1
+    while ((isTRUE(tmp[ind] == tmp[ind+2]) && 
+            isTRUE(tmp[ind+1] == tmp[ind+3]))) {
+      alter <- alter + 1
+      ind <- ind + 4
+      if (ind == length (tmp) - 4)
+      {
+        break
+      } else {
+        ind <- ind + 1
+      }
+    }
+    alt_run[g] <- alter
+  }
+  alter_tibble <- tibble (subj_id = unique(data[[id_col]]),
+                          alt_run = alt_run)
+  alt_outlier <- filter (alter_tibble, alt_run > 2)$subj_id
+  problematic_dat <- filter (data, data[[id_col]] %in% alt_outlier) |>
+    mutate (diag = "alternative responding style")
+  return (problematic_dat)
+}
+
+
+## -------- abnormal reaction time (OPTIONAL)--------
+## ------ requires long-formatted data with RT for each item
+detect_abnormal_rt <- function (data, id_col, rt_col) {
+  rt_all <- aggregate (data[[rt_col]], by=list (data[[id_col]]), FUN=sum)
+  rt_outlier <- filter (data, data[[id_col]] %in% subset (rt_all,
+                                                          x <= quantile (x, prob = 0.05) |
+                                                            ## remove top and bottom 5% of reaction time
+                                                          x >= quantile (x, prob = 0.95))[["Group.1"]]) |> 
+    mutate (diag = "abnormal reaction time")
+  return (rt_outlier)
+}
+
+full_diagnosis <- function (data, id_col, rt_col, ques_leng){
+  casual_dat <- detect_casual_or_repeat(data, id_col = "p_id", ques_leng)
+  alt_dat <- detect_alternative(data, id_col = "p_id")
+  conservative <- detect_conservative(data, id_col = "p_id")
+  abnormal_rt_dat <- detect_abnormal_rt(data, id_col = "p_id", rt_col = "rt")
+  diagnosis_dat <- bind_rows(casual_dat, alt_dat, conservative, abnormal_rt_dat)
+  return (diagnosis_dat)
+}
+#+end_src
